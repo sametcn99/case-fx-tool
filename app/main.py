@@ -248,7 +248,6 @@ async def convert(
         resolved_date if was_explicit else None,
         today=today,
     )
-    conversion.check_staleness(resolved_date, rate_date)
 
     return DecimalJSONResponse(
         {

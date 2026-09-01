@@ -173,9 +173,10 @@ To reproduce the evaluator's no-network setup:
 FX_UPSTREAM_BASE=http://127.0.0.1:1 ./test.sh
 ```
 
-At the time of this review, the suite ends with `130 passed`. A known
-Starlette/httpx deprecation warning may also be printed; it does not fail the
-tests. Do not start `run.sh` first: the tests use an in-process fake upstream.
+The test count is intentionally not hard-coded because the suite may grow. A
+known Starlette/httpx deprecation warning may also be printed; it does not fail
+the tests. Do not start `run.sh` first: the tests use an in-process fake
+upstream.
 
 Two closed-port tests are written against POSIX socket behaviour. Run natively
 on Windows — as opposed to inside Git Bash's POSIX layer or WSL — a connection
@@ -231,8 +232,8 @@ FX_UPSTREAM_BASE=http://127.0.0.1:1 ./test.sh
 ```
 
 The script creates or reuses `.venv`; no service process or internet connection
-is needed. The suite should end with `92 passed`; the existing deprecation
-warning may appear.
+is needed. The test count is intentionally not hard-coded because the suite may
+grow; the existing deprecation warning may appear.
 
 </details>
 

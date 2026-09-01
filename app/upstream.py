@@ -1,8 +1,9 @@
 """Frankfurter HTTP client and the small cache around it.
 
 This module deliberately stops at the upstream boundary.  It returns the rate
-and the date Frankfurter actually published it; request validation, stale-rate
-policy, and conversion arithmetic belong to the layers above it.
+and the date Frankfurter actually published it; request validation and
+conversion arithmetic belong to the layers above it.  The stale-rate guard is
+applied before caching so a rejected upstream value cannot poison the cache.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import time
 
 import httpx
 
-from app import config
+from app import config, conversion
 from app.errors import (
     FxError,
     RateUnavailable,
@@ -210,6 +211,11 @@ class FrankfurterClient:
                 target,
                 asked_date=asked_date,
             )
+
+            # Stale rates are not usable endpoint results. Reject them before
+            # caching so a transiently old upstream response cannot suppress a
+            # recovered rate for the full historical TTL.
+            conversion.check_staleness(asked_date, result[1])
 
             # Only successful, structurally valid responses enter the cache.
             self._cache_put(key, result, _ttl_for(date_key, today))

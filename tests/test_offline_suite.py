@@ -92,6 +92,32 @@ def test_eight_day_old_rate_is_rejected(client, fake_upstream):
     )
 
 
+def test_stale_rate_is_not_cached_when_upstream_recovers(client, fake_upstream):
+    """A stale response must not block a fresh response for the same key."""
+
+    params = query(date="2026-08-29")
+    fake_upstream.set_rate("/v1/2026-08-29", rate_date="2026-08-21")
+
+    first = client.get(CONVERT, params=params)
+    assert_error(first, 404, "rate_too_stale")
+
+    fake_upstream.set_rate(
+        "/v1/2026-08-29",
+        rate_date="2026-08-28",
+        rate="1.09",
+    )
+    second = client.get(CONVERT, params=params)
+
+    assert second.status_code == 200
+    assert second.json()["rate_date"] == "2026-08-28"
+    assert second.json()["rate"] == 1.09
+    assert fake_upstream.paths == [
+        "/v1/currencies",
+        "/v1/2026-08-29",
+        "/v1/2026-08-29",
+    ]
+
+
 @pytest.mark.parametrize("rate", ["0", "-1"])
 def test_non_positive_upstream_rate_is_rejected(client, fake_upstream, rate):
     fake_upstream.set_rate(
