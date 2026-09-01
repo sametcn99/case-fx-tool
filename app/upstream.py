@@ -299,8 +299,14 @@ class FrankfurterClient:
             # can stop a hostile response before it is in memory, and the whole
             # exchange sits under one deadline that httpx's per-read timeout
             # cannot provide.
-            async with self._upstream_slots:
-                async with asyncio.timeout(UPSTREAM_TOTAL_TIMEOUT_SECONDS):
+            async with asyncio.timeout(UPSTREAM_TOTAL_TIMEOUT_SECONDS):
+                # The deadline is started before the slot is acquired, not
+                # after. Queueing is time the caller spends waiting too, so
+                # with these nested the other way a request could sit through
+                # several other calls' worth of queueing and still be judged
+                # inside its budget: the bound would cover the exchange but
+                # not the wait for permission to begin it.
+                async with self._upstream_slots:
                     async with self._http.stream("GET", url, params=params) as response:
                         if response.status_code == 404 and not_found_is_rate:
                             raise RateUnavailable(
@@ -444,13 +450,23 @@ def _parse_rate_payload(
         # The endpoint accepts amounts up to MAX_AMOUNT and rounds to cents.
         # Reject rates that cannot produce a representable result before they
         # enter the cache.
-        (config.MAX_AMOUNT * rate).quantize(
+        largest_result = (config.MAX_AMOUNT * rate).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
     except DecimalException as exc:
         raise UpstreamInvalidResponse(
             "The exchange-rate response contains a rate that is too large."
         ) from exc
+    if largest_result == 0:
+        # The mirror image of the check above, and the same guard `amount`
+        # already has on the way in. The response renders `rate` in positional
+        # notation, so `1e-100000000` — positive, finite, and thirteen bytes
+        # inside a body that passes the 1 MB cap — would render a hundred
+        # million characters. Nothing is lost by refusing it: a rate this small
+        # converts every amount the endpoint accepts into 0.00 anyway.
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains a rate that is too small."
+        )
 
     raw_date = payload.get("date")
     if not isinstance(raw_date, str):

@@ -56,6 +56,23 @@ def test_documented_ten_decimal_places_still_works(client, fake_upstream):
     assert "1000000.1234567891" in response.text
 
 
+def test_a_tiny_upstream_rate_is_not_an_amplifier_either(client, fake_upstream):
+    """`rate` is echoed in positional notation just like `amount` is.
+
+    The exponent is deliberately kept modest here so that removing the guard
+    fails this assertion instead of rendering a body large enough to take the
+    test run down with it.
+    """
+
+    fake_upstream.set_rate("/v1/2026-08-28", rate_date="2026-08-28", rate="1e-100000")
+
+    response = client.get(CONVERT, params=query(date="2026-08-28"))
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "upstream_invalid_response"
+    assert len(response.content) < 500
+
+
 # --- 2. the upstream body is bounded, and so is the whole exchange -----------
 
 
@@ -133,6 +150,44 @@ async def test_outbound_calls_are_bounded_by_a_semaphore():
         await client.close()
 
     assert peak <= upstream_module.MAX_CONCURRENT_UPSTREAM_REQUESTS
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_a_free_slot_counts_against_the_deadline(monkeypatch):
+    """Queueing for a slot is time the caller spends waiting, too.
+
+    With the deadline nested inside the concurrency ceiling instead of around
+    it, the second request below waits out the first one for free and is then
+    judged to have finished inside its budget. The documented ceiling would
+    bound the exchange but not the wait for permission to begin it.
+    """
+
+    monkeypatch.setattr(upstream_module, "MAX_CONCURRENT_UPSTREAM_REQUESTS", 1)
+    monkeypatch.setattr(upstream_module, "UPSTREAM_TOTAL_TIMEOUT_SECONDS", 0.18)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        # Comfortably inside the deadline alone; two of them through a single
+        # slot are not.
+        await asyncio.sleep(0.1)
+        day = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200,
+            json={"base": "EUR", "date": day, "rates": {"TRY": 1.0847}},
+            request=request,
+        )
+
+    client = FrankfurterClient(transport=httpx.MockTransport(slow))
+    try:
+        first, second = await asyncio.gather(
+            client.get_rate("EUR", "TRY", "2026-08-27"),
+            client.get_rate("EUR", "TRY", "2026-08-28"),
+            return_exceptions=True,
+        )
+    finally:
+        await client.close()
+
+    assert not isinstance(first, BaseException)
+    assert isinstance(second, UpstreamTimeout)
 
 
 # --- 3. a broken upstream is never reported as our own bug -------------------

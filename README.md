@@ -351,6 +351,10 @@ so a few ceilings exist to keep one caller from becoming everyone's problem:
 | Concurrent upstream calls         | 8           | no                          |
 | Decimal places in `amount`        | 10          | no                          |
 
+The 8-second budget covers the wait for a free concurrency slot as well as the
+exchange itself, so a request that cannot start in time fails with
+`upstream_timeout` instead of quietly outliving the ceiling above.
+
 Set `FX_RATE_LIMIT_PER_MINUTE=0` to turn the limiter off when something in
 front of the service already does that job. `/health` is never rate limited.
 

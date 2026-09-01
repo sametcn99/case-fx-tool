@@ -193,6 +193,50 @@ async def test_rate_that_cannot_produce_a_max_amount_result_is_invalid(client, f
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_rate", ["1e-15", "1e-100000000"])
+async def test_rate_too_small_to_move_any_amount_is_invalid(client, fake, raw_rate):
+    """The lower half of the bound above.
+
+    ``1e-15`` cannot convert even MAX_AMOUNT into a non-zero result, and the
+    extreme case is what stops a thirteen-byte token from being echoed back as
+    a hundred million characters.
+    """
+
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        content=(
+            f'{{"base":"EUR","date":"2026-08-28","rates":{{"TRY":{raw_rate}}}}}'
+        ).encode(),
+    )
+
+    with pytest.raises(UpstreamInvalidResponse):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_rate", ["1e-14", "0.000048"])
+async def test_genuinely_small_rates_are_still_accepted(client, fake, raw_rate):
+    """The bound has to clear real pairs, not just absurd ones.
+
+    ``1e-14`` is the smallest rate that still moves MAX_AMOUNT off zero, and
+    ``0.000048`` is the order of magnitude of a real ECB pair such as IDR/GBP.
+    """
+
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        content=(
+            f'{{"base":"EUR","date":"2026-08-28","rates":{{"TRY":{raw_rate}}}}}'
+        ).encode(),
+    )
+
+    rate, _ = await client.get_rate("EUR", "TRY", "2026-08-28")
+
+    assert rate == Decimal(raw_rate)
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_invalid_upstream_url_is_unavailable(monkeypatch):
     monkeypatch.setenv("FX_UPSTREAM_BASE", "not-a-url")
     client = FrankfurterClient()

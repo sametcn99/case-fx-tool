@@ -43,6 +43,14 @@
   `1E-100000000` is positive, finite and far below `MAX_AMOUNT`, and rendered a
   hundred megabytes from a seventeen-byte query. Bounded at ten decimal places,
   which is the precision the contract already documented.
+- **Bounded rate exponent:** the same amplifier existed on the way back and was
+  missed the first time. `rate` is echoed in positional notation too, and the
+  parser bounded it from above (a rate whose product with `MAX_AMOUNT` overflows
+  is rejected) but not from below, so `1e-100000000` — thirteen bytes inside a
+  body that passes the 1 MB cap — rendered a hundred million characters. The
+  bound is the mirror of the existing one rather than a new constant: a rate
+  that cannot move `MAX_AMOUNT` off `0.00` is refused, which costs nothing real
+  and needs no new error code.
 - **Bounded upstream body:** the response is streamed and abandoned past 1 MB.
   httpx imposes no limit of its own, so previously any body size was buffered
   faithfully. The cap is applied to decoded bytes, so a compressed body that
@@ -50,6 +58,13 @@
 - **One deadline for the whole upstream call:** httpx's read timeout applies
   per socket read, which an upstream trickling one byte at a time satisfies
   forever. An `asyncio.timeout` of 8 s is what actually bounds the exchange.
+- **The deadline starts before the concurrency slot, not after:** it was nested
+  inside the 8-call ceiling, so time spent queueing for a slot did not count
+  against it. Measured with a 0.5 s deadline and 24 concurrent keys, the
+  slowest call took 1.36 s and reported no timeout at all — the bound covered
+  the exchange but not the wait for permission to begin it. Swapping the two
+  makes the documented ceiling true, and turns a silent overrun into an honest
+  `upstream_timeout` under sustained load.
 - **A broken upstream is never our bug:** the JSON parse now also catches
   `RecursionError` (deeply nested body) and plain `ValueError` (CPython's
   integer-string digit limit, which a long unquoted number trips). Both used to
