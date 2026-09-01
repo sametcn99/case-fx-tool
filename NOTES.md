@@ -91,11 +91,28 @@
 
 ## With another day
 
-- Add limited retries with jitter for transient timeouts and 5xx responses.
-- Use a smarter intraday TTL for `latest`, based on the ECB publication window.
-- Add structured per-request logs and an `X-Request-Id`.
-- Refresh the currency catalogue in the background instead of only on demand.
-- Add Hypothesis tests for Decimal arithmetic boundaries.
+- Add one or two bounded, jittered retries for transient timeouts and 5xx
+  responses. Keep retries inside the existing eight-second end-to-end deadline,
+  and do not retry 404s or invalid upstream data; otherwise the resilience
+  feature simply amplifies an outage.
+- Replace the fixed five-minute `latest` TTL with a publication-window-aware
+  TTL in `Europe/Berlin`, while retaining a hard upper bound and a safe
+  transition at the ECB day boundary.
+- Add structured per-request logs and an `X-Request-Id`, including cache,
+  upstream, latency, and error fields so a model-visible failure can be traced
+  without putting customer data in logs.
+- Refresh the currency catalogue in the background (or with a bounded
+  successful TTL) instead of keeping it for the process lifetime. Retain the
+  last known good catalogue if a refresh fails, and keep the existing short
+  negative cache for a catalogue that has never loaded.
+- Add property-based tests (for example with Hypothesis) for Decimal parsing,
+  exponent limits, `MAX_AMOUNT`, and `ROUND_HALF_UP` boundaries. The known
+  security regressions are covered deterministically today; generated cases
+  would protect the arithmetic and serialization invariants more broadly.
+- Make the per-client limiter proxy-aware and share its state when the service
+  runs behind multiple workers. Today it keys on `request.client.host`, so a
+  reverse proxy can collapse all customers into one bucket and each process
+  maintains a separate approximate quota.
 
 ## AI tools
 
