@@ -47,7 +47,7 @@ def validate_currency(raw: str, field: str) -> str:
     Whether the code actually exists is a separate question, answered against
     the upstream's currency list.
     """
-    if not _CURRENCY_PATTERN.match(raw or ""):
+    if not isinstance(raw, str) or not _CURRENCY_PATTERN.fullmatch(raw):
         raise InvalidCurrencyCode(
             f"'{field}' must be a three-letter currency code such as EUR; got {raw!r}."
         )
@@ -72,7 +72,11 @@ def validate_date(raw: str, today: date | None = None) -> date:
     """Parse and bounds-check the date the caller asked about."""
     try:
         asked = datetime.strptime(raw, "%Y-%m-%d").date()
-    except ValueError:
+    except (TypeError, ValueError):
+        raise InvalidDate(
+            f"date must be written as YYYY-MM-DD; got {raw!r}."
+        ) from None
+    if asked.isoformat() != raw:
         raise InvalidDate(
             f"date must be written as YYYY-MM-DD; got {raw!r}."
         ) from None

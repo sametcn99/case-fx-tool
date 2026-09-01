@@ -57,7 +57,7 @@ async def test_rate_keeps_decimal_and_upstream_date(client, fake, monkeypatch):
     monkeypatch.delenv("FX_UPSTREAM_BASE", raising=False)
     fake.responses["/v1/2026-08-28"] = httpx.Response(
         200,
-        content=b'{"date":"2026-08-28","rates":{"TRY":1.0847}}',
+        content=b'{"base":"EUR","date":"2026-08-28","rates":{"TRY":1.0847}}',
     )
 
     rate, rate_date = await client.get_rate("eur", "try", date(2026, 8, 28))
@@ -85,7 +85,7 @@ async def test_same_question_is_cached(client, fake):
 async def test_date_is_part_of_cache_key(client, fake):
     fake.responses["/v1/2026-08-29"] = httpx.Response(
         200,
-        json={"date": "2026-08-29", "rates": {"TRY": 56.5}},
+        json={"base": "EUR", "date": "2026-08-29", "rates": {"TRY": 56.5}},
     )
 
     await client.get_rate("EUR", "TRY", "2026-08-28")
@@ -132,7 +132,8 @@ async def test_non_positive_rate_is_invalid(client, fake, raw_rate):
     fake.responses["/v1/2026-08-28"] = httpx.Response(
         200,
         content=(
-            f'{{"date":"2026-08-28","rates":{{"TRY":{raw_rate}}}}}'
+            f'{{"base":"EUR","date":"2026-08-28",'
+            f'"rates":{{"TRY":{raw_rate}}}}}'
         ).encode(),
     )
 
@@ -145,7 +146,7 @@ async def test_non_positive_rate_is_invalid(client, fake, raw_rate):
 async def test_future_publication_date_is_invalid_and_not_cached(client, fake):
     fake.responses["/v1/2026-08-28"] = httpx.Response(
         200,
-        content=b'{"date":"2026-08-29","rates":{"TRY":1.2}}',
+        content=b'{"base":"EUR","date":"2026-08-29","rates":{"TRY":1.2}}',
     )
 
     with pytest.raises(UpstreamInvalidResponse):
@@ -153,13 +154,66 @@ async def test_future_publication_date_is_invalid_and_not_cached(client, fake):
 
     fake.responses["/v1/2026-08-28"] = httpx.Response(
         200,
-        content=b'{"date":"2026-08-28","rates":{"TRY":1.2}}',
+        content=b'{"base":"EUR","date":"2026-08-28","rates":{"TRY":1.2}}',
     )
     assert await client.get_rate("EUR", "TRY", "2026-08-28") == (
         Decimal("1.2"),
         date(2026, 8, 28),
     )
     assert len(fake.calls) == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_base", [None, "USD"])
+async def test_wrong_or_missing_upstream_base_is_invalid(client, fake, raw_base):
+    payload = {
+        "date": "2026-08-28",
+        "rates": {"TRY": 1.2},
+    }
+    if raw_base is not None:
+        payload["base"] = raw_base
+    fake.responses["/v1/2026-08-28"] = httpx.Response(200, json=payload)
+
+    with pytest.raises(UpstreamInvalidResponse):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_that_cannot_produce_a_max_amount_result_is_invalid(client, fake):
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        content=b'{"base":"EUR","date":"2026-08-28","rates":{"TRY":1e100}}',
+    )
+
+    with pytest.raises(UpstreamInvalidResponse):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_upstream_url_is_unavailable(monkeypatch):
+    monkeypatch.setenv("FX_UPSTREAM_BASE", "not-a-url")
+    client = FrankfurterClient()
+
+    try:
+        with pytest.raises(UpstreamUnavailable):
+            await client.get_rate("EUR", "TRY", "2026-08-28")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_date", ["2026-8-28", "2026-08-8"])
+async def test_non_strict_upstream_publication_date_is_invalid(client, fake, raw_date):
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        json={"base": "EUR", "date": raw_date, "rates": {"TRY": 1.2}},
+    )
+
+    with pytest.raises(UpstreamInvalidResponse):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
     await client.close()
 
 

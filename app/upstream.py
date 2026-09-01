@@ -11,7 +11,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 import json
 import re
 import time
@@ -125,7 +125,12 @@ class FrankfurterClient:
             params={"base": base, "symbols": target},
             not_found_is_rate=True,
         )
-        result = _parse_rate_payload(payload, target, asked_date=asked_date)
+        result = _parse_rate_payload(
+            payload,
+            base,
+            target,
+            asked_date=asked_date,
+        )
 
         # Only successful, structurally valid responses enter the cache.
         self._cache_put(key, result, _ttl_for(date_key))
@@ -195,6 +200,10 @@ class FrankfurterClient:
             raise UpstreamUnavailable(
                 "The exchange-rate service could not be reached."
             ) from exc
+        except (httpx.InvalidURL, httpx.RequestError) as exc:
+            raise UpstreamUnavailable(
+                "The exchange-rate service could not be reached."
+            ) from exc
 
         if response.status_code == 404 and not_found_is_rate:
             raise RateUnavailable("No exchange rate is available for that request.")
@@ -231,7 +240,10 @@ def _requested_date(requested_date: date | str | None) -> date:
         return requested_date.date()
     if isinstance(requested_date, date):
         return requested_date
-    return datetime.strptime(requested_date, "%Y-%m-%d").date()
+    parsed = datetime.strptime(requested_date, "%Y-%m-%d").date()
+    if parsed.isoformat() != requested_date:
+        raise ValueError("requested_date must be written as YYYY-MM-DD")
+    return parsed
 
 
 def _ttl_for(date_key: str) -> int:
@@ -242,6 +254,7 @@ def _ttl_for(date_key: str) -> int:
 
 def _parse_rate_payload(
     payload: object,
+    base: str,
     target: str,
     *,
     asked_date: date | None = None,
@@ -249,6 +262,12 @@ def _parse_rate_payload(
     if not isinstance(payload, Mapping):
         raise UpstreamInvalidResponse(
             "The exchange-rate response is missing its rates object."
+        )
+
+    raw_base = payload.get("base")
+    if not isinstance(raw_base, str) or raw_base.upper() != base:
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains an invalid base currency."
         )
 
     rates = payload.get("rates")
@@ -275,6 +294,18 @@ def _parse_rate_payload(
             "The exchange-rate response contains a non-positive rate."
         )
 
+    try:
+        # The endpoint accepts amounts up to MAX_AMOUNT and rounds to cents.
+        # Reject rates that cannot produce a representable result before they
+        # enter the cache.
+        (config.MAX_AMOUNT * rate).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    except DecimalException as exc:
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains a rate that is too large."
+        ) from exc
+
     raw_date = payload.get("date")
     if not isinstance(raw_date, str):
         raise UpstreamInvalidResponse(
@@ -285,10 +316,14 @@ def _parse_rate_payload(
         # contract strict rather than accepting Python's newer compact-date
         # extensions (for example, 20260828).
         published_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise UpstreamInvalidResponse(
             "The exchange-rate response contains an invalid publication date."
         ) from exc
+    if published_date.isoformat() != raw_date:
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains an invalid publication date."
+        )
 
     if published_date < config.SERIES_START or (
         asked_date is not None and published_date > asked_date

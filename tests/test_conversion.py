@@ -70,7 +70,8 @@ class FakeUpstream:
         return httpx.Response(
             200,
             content=(
-                f'{{"date":"{self.rate_date}","rates":{{"TRY":{self.rate}}}}}'
+                f'{{"base":"EUR","date":"{self.rate_date}",'
+                f'"rates":{{"TRY":{self.rate}}}}}'
             ).encode(),
             request=request,
         )

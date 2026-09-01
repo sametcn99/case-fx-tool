@@ -65,7 +65,7 @@ def test_a_long_fraction_is_accepted_and_kept_exactly():
 # --- currencies ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("code", ["EU", "EURO", "E1R", "", "12"])
+@pytest.mark.parametrize("code", ["EU", "EURO", "E1R", "", "12", "EUR\n"])
 def test_malformed_currency_codes_are_rejected(client, code):
     assert_error(
         client.get(CONVERT, params=query(**{"from": code})), 400, "invalid_currency_code"
@@ -99,7 +99,18 @@ def test_same_currency_is_caught_after_normalisation(client):
 # --- dates --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["2026-13-01", "28-08-2026", "20260828", "yesterday", ""])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-13-01",
+        "28-08-2026",
+        "20260828",
+        "2026-8-28",
+        "2026-08-8",
+        "yesterday",
+        "",
+    ],
+)
 def test_unparseable_dates_are_rejected(client, value):
     assert_error(client.get(CONVERT, params=query(date=value)), 400, "invalid_date")
 

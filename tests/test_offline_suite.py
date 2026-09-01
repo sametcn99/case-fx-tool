@@ -120,6 +120,49 @@ def test_future_upstream_publication_date_is_rejected(client, fake_upstream):
     )
 
 
+def test_wrong_upstream_base_is_rejected(client, fake_upstream):
+    fake_upstream.set_content(
+        "/v1/2026-08-28",
+        b'{"base":"USD","date":"2026-08-28","rates":{"TRY":1.2}}',
+    )
+
+    assert_error(
+        client.get(CONVERT, params=query(date="2026-08-28")),
+        502,
+        "upstream_invalid_response",
+    )
+
+
+def test_unrepresentable_upstream_rate_is_rejected_without_cache_poisoning(
+    client, fake_upstream
+):
+    fake_upstream.set_rate(
+        "/v1/2026-08-28",
+        rate_date="2026-08-28",
+        rate="1e100",
+    )
+
+    assert_error(
+        client.get(CONVERT, params=query(date="2026-08-28")),
+        502,
+        "upstream_invalid_response",
+    )
+
+    fake_upstream.set_rate(
+        "/v1/2026-08-28",
+        rate_date="2026-08-28",
+        rate="1.0847",
+    )
+    response = client.get(CONVERT, params=query(date="2026-08-28"))
+
+    assert response.status_code == 200
+    assert fake_upstream.paths == [
+        "/v1/currencies",
+        "/v1/2026-08-28",
+        "/v1/2026-08-28",
+    ]
+
+
 def test_future_date_is_rejected_before_upstream(client, fake_upstream):
     tomorrow = config.today_in_ecb_tz() + timedelta(days=1)
 
@@ -292,6 +335,15 @@ def test_closed_port_is_unavailable_without_public_network(monkeypatch):
     monkeypatch.setenv("FX_UPSTREAM_BASE", "http://127.0.0.1:1")
 
     with TestClient(app) as client:
+        response = client.get(CONVERT, params=query(date="2026-08-28"))
+
+    assert_error(response, 502, "upstream_unavailable")
+
+
+def test_invalid_upstream_url_is_unavailable_without_internal_error(monkeypatch):
+    monkeypatch.setenv("FX_UPSTREAM_BASE", "not-a-url")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
         response = client.get(CONVERT, params=query(date="2026-08-28"))
 
     assert_error(response, 502, "upstream_unavailable")

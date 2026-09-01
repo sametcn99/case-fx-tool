@@ -23,10 +23,18 @@
 - **Upstream response hardening:** accept only finite, positive rates and
   publication dates from `1999-01-04` through the requested date. Invalid
   upstream data is rejected as `upstream_invalid_response` before it can be
-  cached or shown to a customer.
+  cached or shown to a customer. The response `base` must also match the
+  requested source currency, and the rate must be representable for the
+  documented maximum amount when rounded to cents.
+- **Strict external formats:** request and upstream publication dates must
+  round-trip to `YYYY-MM-DD`; currency codes use a full three-letter match so
+  control characters cannot pass validation.
 - **Timeout classification:** map every `httpx.TimeoutException`, including
   `ConnectTimeout`, to `upstream_timeout` (504). Actual network failures remain
   `upstream_unavailable` (502), so callers can distinguish retryable timeouts.
+- **Invalid upstream configuration:** malformed `FX_UPSTREAM_BASE` request
+  errors are mapped to `upstream_unavailable` (502) instead of leaking as an
+  `internal_error`.
 
 ## With another day
 
