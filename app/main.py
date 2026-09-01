@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app import validation
 from app.errors import FxError, InvalidAmount, InvalidCurrencyCode, InvalidDate, InvalidRequest
@@ -132,6 +132,34 @@ async def convert(
 
     raise _NotImplementedYet(
         "This endpoint does not fetch rates yet; only its inputs are checked."
+    )
+
+
+@app.get("/scalar", include_in_schema=False)
+async def scalar_reference() -> HTMLResponse:
+    """A browsable API reference, for trying the endpoint by hand.
+
+    Kept out of the OpenAPI schema on purpose: that document is what a calling
+    agent reads to build its tool definition, and it should describe exactly one
+    endpoint. This is a convenience for humans, not part of the tool surface.
+    """
+    return HTMLResponse(
+        """<!doctype html>
+<html>
+  <head>
+    <title>fx-tool API reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <script>
+      Scalar.createApiReference('#app', { url: '/openapi.json' })
+    </script>
+  </body>
+</html>
+"""
     )
 
 
