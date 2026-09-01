@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import logging
+from collections.abc import Mapping
 from decimal import Decimal
+import json
+import logging
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 
-from app import validation
-from app.errors import FxError, InvalidAmount, InvalidCurrencyCode, InvalidDate, InvalidRequest
+from app import conversion, validation
+from app.errors import (
+    FxError,
+    InvalidAmount,
+    InvalidCurrencyCode,
+    InvalidDate,
+    InvalidRequest,
+    UnknownCurrency,
+)
 from app.upstream import FrankfurterClient
 
 logger = logging.getLogger("fx-tool")
@@ -38,13 +48,6 @@ app = FastAPI(
         "actually belongs to."
     ),
 )
-
-
-class _NotImplementedYet(FxError):
-    """Temporary. The lookup and the arithmetic arrive with the upstream client."""
-
-    http_status = 501
-    error_code = "not_implemented"
 
 
 # --- one error shape, whoever raised it --------------------------------------
@@ -106,8 +109,51 @@ async def handle_unexpected_error(request: Request, exc: Exception) -> JSONRespo
 # --- routes ------------------------------------------------------------------
 
 
-@app.get("/tools/convert")
+def _json_fragment(value: object) -> str:
+    """Encode JSON while retaining Decimal values as numeric decimal tokens."""
+
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("non-finite Decimal cannot be encoded as JSON")
+        return format(value, "f")
+    if isinstance(value, Mapping):
+        items = ",".join(
+            f"{json.dumps(str(key), ensure_ascii=False)}:{_json_fragment(item)}"
+            for key, item in value.items()
+        )
+        return "{" + items + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_json_fragment(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+class DecimalJSONResponse(Response):
+    """JSON response that does not route Decimal values through float."""
+
+    media_type = "application/json"
+
+    def render(self, content: object) -> bytes:
+        return _json_fragment(content).encode("utf-8")
+
+
+class ConversionResponse(BaseModel):
+    """The documented success shape; runtime rendering stays Decimal-safe."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    amount: Decimal = Field(json_schema_extra={"type": "number"})
+    from_currency: str = Field(alias="from")
+    to_currency: str = Field(alias="to")
+    rate: Decimal = Field(json_schema_extra={"type": "number"})
+    result: Decimal = Field(json_schema_extra={"type": "number"})
+    rate_date: str
+    asked_date: str
+    source: str
+
+
+@app.get("/tools/convert", response_model=ConversionResponse)
 async def convert(
+    request: Request,
     amount: Decimal = Query(
         ...,
         description="How much to convert. Must be greater than zero.",
@@ -136,17 +182,48 @@ async def convert(
         ),
         examples=["2026-08-28"],
     ),
-) -> dict:
+) -> Response:
     """Convert an amount between two currencies at ECB reference rates."""
     validation.validate_amount(amount)
     base = validation.validate_currency(from_currency, "from")
     target = validation.validate_currency(to_currency, "to")
     validation.validate_pair(base, target)
-    if asked_date is not None:
-        validation.validate_date(asked_date)
+    resolved_date = conversion.resolve_asked_date(asked_date)
+    was_explicit = asked_date is not None
 
-    raise _NotImplementedYet(
-        "This endpoint does not fetch rates yet; only its inputs are checked."
+    upstream: FrankfurterClient = request.app.state.upstream
+
+    # The currency catalogue only improves an otherwise ambiguous 404.  If it
+    # is unavailable, fail open and let the rate request provide the answer.
+    try:
+        currencies = await upstream.get_currencies()
+    except FxError:
+        currencies = None
+    if currencies is not None:
+        for code, field in ((base, "from"), (target, "to")):
+            if code not in currencies:
+                raise UnknownCurrency(
+                    f"'{field}' currency {code} is not published by the ECB."
+                )
+
+    rate, rate_date = await upstream.get_rate(
+        base,
+        target,
+        resolved_date if was_explicit else None,
+    )
+    conversion.check_staleness(resolved_date, rate_date)
+
+    return DecimalJSONResponse(
+        {
+            "amount": amount,
+            "from": base,
+            "to": target,
+            "rate": rate,
+            "result": conversion.compute_result(amount, rate),
+            "rate_date": rate_date.isoformat(),
+            "asked_date": resolved_date.isoformat(),
+            "source": "ECB via frankfurter.dev",
+        }
     )
 
 
