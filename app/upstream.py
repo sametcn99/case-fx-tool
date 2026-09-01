@@ -7,8 +7,9 @@ policy, and conversion arithmetic belong to the layers above it.
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
@@ -20,6 +21,7 @@ import httpx
 
 from app import config
 from app.errors import (
+    FxError,
     RateUnavailable,
     UpstreamError,
     UpstreamInvalidResponse,
@@ -37,10 +39,36 @@ UPSTREAM_TIMEOUT = httpx.Timeout(
     write=3.0,
     pool=3.0,
 )
+
+# httpx's read timeout applies to each socket read, not to the exchange as a
+# whole, so an upstream trickling one byte every two seconds satisfies it
+# forever while holding a request, a task and a pool slot open. This is the
+# deadline that actually bounds the call.
+UPSTREAM_TOTAL_TIMEOUT_SECONDS = 8.0
+
+# A rates or currencies document is a few kilobytes. httpx imposes no limit of
+# its own, so without this a hostile or misconfigured upstream can hand us a
+# body of any size and we will faithfully buffer all of it.
+MAX_RESPONSE_BYTES = 1024 * 1024
+
+# A ceiling on upstream calls in flight at once, so that a burst of distinct
+# cache keys cannot fan out into an unbounded number of connections.
+MAX_CONCURRENT_UPSTREAM_REQUESTS = 8
+
+# The endpoint fails open when the currency catalogue is unavailable. Without a
+# negative cache it would retry the dead catalogue on every single conversion
+# and pay a full connect timeout each time, so failing open would cost more
+# than failing closed. Fail open *fast* instead.
+CURRENCY_FAILURE_TTL_SECONDS = 60
+
 RATE_CACHE_MAXSIZE = 512
 HISTORICAL_TTL_SECONDS = 24 * 60 * 60
 CURRENT_TTL_SECONDS = 5 * 60
 _CURRENCY_CODE = re.compile(r"^[A-Za-z]{3}$")
+
+# Sentinel key for the currency catalogue in the in-flight map; the rate keys
+# there are 3-tuples, so this cannot collide with one.
+_CURRENCIES_KEY = "currencies"
 
 
 @dataclass(frozen=True)
@@ -75,6 +103,9 @@ class FrankfurterClient:
         self._clock = clock or time.monotonic
         self._rate_cache: OrderedDict[CacheKey, _CacheEntry] = OrderedDict()
         self._currencies: frozenset[str] | None = None
+        self._currencies_failed_until: float | None = None
+        self._inflight: dict[object, asyncio.Future] = {}
+        self._upstream_slots = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM_REQUESTS)
 
     @property
     def http_client(self) -> httpx.AsyncClient:
@@ -99,52 +130,104 @@ class FrankfurterClient:
 
         self._rate_cache.clear()
         self._currencies = None
+        self._currencies_failed_until = None
 
     clear_cache = clear
+
+    async def _single_flight(
+        self,
+        key: object,
+        fetch: Callable[[], Awaitable[object]],
+    ) -> object:
+        """Run ``fetch`` once per key and share its outcome with concurrent callers.
+
+        Without this, every concurrent miss on the same key opens its own
+        upstream request — worst precisely at a cold start or a TTL expiry,
+        which is when traffic is heaviest.
+        """
+
+        inflight = self._inflight.get(key)
+        if inflight is not None:
+            # Shielded so that one caller giving up cannot cancel the fetch the
+            # other waiters are still relying on.
+            return await asyncio.shield(inflight)
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._inflight[key] = future
+        try:
+            result = await fetch()
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            self._inflight.pop(key, None)
+            # Retrieve a leader-only failure so asyncio does not log
+            # "exception was never retrieved" when nobody was waiting on it.
+            if not future.cancelled():
+                future.exception()
 
     async def get_rate(
         self,
         base: str,
         target: str,
         requested_date: date | str | None = None,
+        *,
+        today: date | None = None,
     ) -> RateResult:
-        """Return ``(rate, published_date)`` for one requested observation."""
+        """Return ``(rate, published_date)`` for one requested observation.
 
+        ``today`` lets the caller pin the ECB day boundary for the whole
+        request. Reading the clock again here is what allows a request that
+        straddles midnight to reject its own valid answer.
+        """
+
+        today = today or config.today_in_ecb_tz()
         base = base.upper()
         target = target.upper()
-        asked_date = _requested_date(requested_date)
-        date_key = _date_key(requested_date)
+        asked_date = _requested_date(requested_date, today)
+        date_key = _date_key(requested_date, today)
         key = (base, target, date_key)
 
         cached = self._cache_get(key)
         if cached is not None:
             return cached
 
-        payload = await self._get_json(
-            config.upstream_url(date_key),
-            params={"base": base, "symbols": target},
-            not_found_is_rate=True,
-        )
-        result = _parse_rate_payload(
-            payload,
-            base,
-            target,
-            asked_date=asked_date,
-        )
+        async def fetch() -> RateResult:
+            payload = await self._get_json(
+                config.upstream_url(date_key),
+                params={"base": base, "symbols": target},
+                not_found_is_rate=True,
+            )
+            result = _parse_rate_payload(
+                payload,
+                base,
+                target,
+                asked_date=asked_date,
+            )
 
-        # Only successful, structurally valid responses enter the cache.
-        self._cache_put(key, result, _ttl_for(date_key))
-        return result
+            # Only successful, structurally valid responses enter the cache.
+            self._cache_put(key, result, _ttl_for(date_key, today))
+            return result
+
+        return await self._single_flight(key, fetch)  # type: ignore[return-value]
 
     async def fetch_rate(
         self,
         base: str,
         target: str,
         requested_date: date | str | None = None,
+        *,
+        today: date | None = None,
     ) -> RateResult:
         """Compatibility spelling for callers that prefer ``fetch_*``."""
 
-        return await self.get_rate(base, target, requested_date)
+        return await self.get_rate(base, target, requested_date, today=today)
 
     async def get_currencies(self) -> frozenset[str]:
         """Return the ECB currency codes, caching a successful list forever."""
@@ -152,15 +235,36 @@ class FrankfurterClient:
         if self._currencies is not None:
             return self._currencies
 
-        payload = await self._get_json(
-            config.upstream_url("currencies"),
-            not_found_is_rate=False,
-        )
-        currencies = _parse_currency_payload(payload)
-        # A failed call raises before this assignment, so failures are never
-        # turned into a permanently cached empty list.
-        self._currencies = currencies
-        return currencies
+        if (
+            self._currencies_failed_until is not None
+            and self._clock() < self._currencies_failed_until
+        ):
+            # The endpoint fails open on this error. Failing open *fast* is the
+            # whole point: a dead catalogue must not add a connect timeout to
+            # every conversion for as long as it stays dead.
+            raise UpstreamUnavailable(
+                "The currency catalogue is temporarily unavailable."
+            )
+
+        async def fetch() -> frozenset[str]:
+            try:
+                payload = await self._get_json(
+                    config.upstream_url("currencies"),
+                    not_found_is_rate=False,
+                )
+                currencies = _parse_currency_payload(payload)
+            except FxError:
+                self._currencies_failed_until = (
+                    self._clock() + CURRENCY_FAILURE_TTL_SECONDS
+                )
+                raise
+            # A failed call raises before this assignment, so failures are never
+            # turned into a permanently cached empty list.
+            self._currencies = currencies
+            self._currencies_failed_until = None
+            return currencies
+
+        return await self._single_flight(_CURRENCIES_KEY, fetch)  # type: ignore[return-value]
 
     async def fetch_currencies(self) -> frozenset[str]:
         return await self.get_currencies()
@@ -191,7 +295,29 @@ class FrankfurterClient:
         not_found_is_rate: bool,
     ) -> object:
         try:
-            response = await self._http.get(url, params=params)
+            # The body is streamed rather than read whole so that the size cap
+            # can stop a hostile response before it is in memory, and the whole
+            # exchange sits under one deadline that httpx's per-read timeout
+            # cannot provide.
+            async with self._upstream_slots:
+                async with asyncio.timeout(UPSTREAM_TOTAL_TIMEOUT_SECONDS):
+                    async with self._http.stream("GET", url, params=params) as response:
+                        if response.status_code == 404 and not_found_is_rate:
+                            raise RateUnavailable(
+                                "No exchange rate is available for that request."
+                            )
+                        if not 200 <= response.status_code < 300:
+                            raise UpstreamError(
+                                "The exchange-rate service returned HTTP "
+                                f"{response.status_code}."
+                            )
+                        content = await _read_capped(response)
+        except TimeoutError as exc:
+            # asyncio.timeout fired: the exchange as a whole outlived its budget
+            # even though no individual socket operation did.
+            raise UpstreamTimeout(
+                "The exchange-rate service took too long to respond."
+            ) from exc
         except httpx.TimeoutException as exc:
             raise UpstreamTimeout(
                 "The exchange-rate service took too long to respond."
@@ -205,18 +331,16 @@ class FrankfurterClient:
                 "The exchange-rate service could not be reached."
             ) from exc
 
-        if response.status_code == 404 and not_found_is_rate:
-            raise RateUnavailable("No exchange rate is available for that request.")
-        if response.status_code >= 500 or not 200 <= response.status_code < 300:
-            raise UpstreamError(
-                f"The exchange-rate service returned HTTP {response.status_code}."
-            )
-
         try:
             # Parsing JSON directly lets numeric rates become Decimal instead of
             # making a float round trip through response.json().
-            return json.loads(response.content, parse_float=Decimal)
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+            return json.loads(content, parse_float=Decimal)
+        except (ValueError, TypeError, RecursionError) as exc:
+            # ValueError covers JSONDecodeError and UnicodeDecodeError, but also
+            # CPython's integer-string digit limit, which a long unquoted number
+            # trips; RecursionError covers a deeply nested body. Every one of
+            # them is the upstream's fault, and none may surface as an
+            # internal_error that tells the caller *we* are broken.
             raise UpstreamInvalidResponse(
                 "The exchange-rate service returned invalid JSON."
             ) from exc
@@ -227,15 +351,36 @@ class FrankfurterClient:
 UpstreamClient = FrankfurterClient
 
 
-def _date_key(requested_date: date | str | None) -> str:
+async def _read_capped(response: httpx.Response) -> bytes:
+    """Read a response body, refusing to buffer more than ``MAX_RESPONSE_BYTES``.
+
+    The cap is applied to decoded bytes as they arrive, so a compressed body
+    that expands past the limit is abandoned at the limit rather than after.
+    """
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise UpstreamInvalidResponse(
+                "The exchange-rate service returned a response that is too large."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _date_key(requested_date: date | str | None, today: date | None = None) -> str:
     if requested_date is None or requested_date == "latest":
         return "latest"
-    return _requested_date(requested_date).isoformat()
+    return _requested_date(requested_date, today).isoformat()
 
 
-def _requested_date(requested_date: date | str | None) -> date:
+def _requested_date(
+    requested_date: date | str | None, today: date | None = None
+) -> date:
     if requested_date is None or requested_date == "latest":
-        return config.today_in_ecb_tz()
+        return today or config.today_in_ecb_tz()
     if isinstance(requested_date, datetime):
         return requested_date.date()
     if isinstance(requested_date, date):
@@ -246,8 +391,9 @@ def _requested_date(requested_date: date | str | None) -> date:
     return parsed
 
 
-def _ttl_for(date_key: str) -> int:
-    if date_key == "latest" or date_key == config.today_in_ecb_tz().isoformat():
+def _ttl_for(date_key: str, today: date | None = None) -> int:
+    today = today or config.today_in_ecb_tz()
+    if date_key == "latest" or date_key == today.isoformat():
         return CURRENT_TTL_SECONDS
     return HISTORICAL_TTL_SECONDS
 

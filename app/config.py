@@ -32,6 +32,21 @@ MAX_STALENESS_DAYS = 7
 # than overflowing to infinity somewhere in the arithmetic.
 MAX_AMOUNT = Decimal("1e12")
 
+# A lower bound on the exponent, which is a different question from the upper
+# bound on the value. The response echoes `amount` back in positional notation,
+# so `1E-100000000` — positive, finite, and far below MAX_AMOUNT — would render
+# as a hundred million characters from a seventeen-byte query string. Ten
+# decimal places is the precision the tool contract already documents.
+MAX_AMOUNT_DECIMALS = 10
+
+# How many requests one client may make per minute against the conversion
+# endpoint. The endpoint is unauthenticated and every cache miss becomes an
+# upstream call, so without a ceiling one caller can walk more distinct
+# (from, to, date) keys than the rate cache holds and turn this service into a
+# free amplifier against the ECB feed. Set FX_RATE_LIMIT_PER_MINUTE=0 to
+# disable it when something in front of the service already does this job.
+DEFAULT_RATE_LIMIT_PER_MINUTE = 60
+
 # The ECB publishes on Frankfurt time, so that is where the day boundary sits.
 # Using UTC would put "today" a day behind during the early hours.
 ECB_TZ = ZoneInfo("Europe/Berlin")
@@ -67,3 +82,12 @@ def port() -> int:
         return int(os.environ["PORT"])
     except (KeyError, ValueError):
         return DEFAULT_PORT
+
+
+def rate_limit_per_minute() -> int:
+    """Requests allowed per client per minute. Zero disables the limiter."""
+    try:
+        value = int(os.environ["FX_RATE_LIMIT_PER_MINUTE"])
+    except (KeyError, ValueError):
+        return DEFAULT_RATE_LIMIT_PER_MINUTE
+    return max(value, 0)

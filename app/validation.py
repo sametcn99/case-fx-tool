@@ -36,8 +36,16 @@ def validate_amount(amount: Decimal) -> Decimal:
         raise InvalidAmount(
             f"amount must not exceed {config.MAX_AMOUNT:f}; got {amount}."
         )
-    # A long fraction is fine: it is carried as a Decimal and only the result is
-    # rounded, so there is no reason to refuse the caller's precision.
+    # A long fraction is carried as a Decimal and only the result is rounded, so
+    # precision itself is not the problem. The exponent is: the response echoes
+    # `amount` back in positional notation, so `1E-100000000` — positive, finite
+    # and far below MAX_AMOUNT — would render a hundred million characters from
+    # a seventeen-byte query. Bound it at the documented precision.
+    if amount.as_tuple().exponent < -config.MAX_AMOUNT_DECIMALS:
+        raise InvalidAmount(
+            f"amount must not have more than {config.MAX_AMOUNT_DECIMALS} "
+            f"decimal places."
+        )
     return amount
 
 

@@ -8,7 +8,8 @@ actually belongs to.
 
 The scripts use Bash. On every platform, the first run creates `.venv` and
 installs the pinned dependencies from `requirements.txt`. The service listens
-on port `8080` by default; `PORT` and `FX_UPSTREAM_BASE` are optional.
+on port `8080` by default; `PORT`, `FX_UPSTREAM_BASE` and
+`FX_RATE_LIMIT_PER_MINUTE` are optional.
 
 <details>
 <summary>Windows (Git Bash or WSL)</summary>
@@ -172,9 +173,16 @@ To reproduce the evaluator's no-network setup:
 FX_UPSTREAM_BASE=http://127.0.0.1:1 ./test.sh
 ```
 
-At the time of this review, the suite ends with `92 passed`. A known
+At the time of this review, the suite ends with `130 passed`. A known
 Starlette/httpx deprecation warning may also be printed; it does not fail the
 tests. Do not start `run.sh` first: the tests use an in-process fake upstream.
+
+Two closed-port tests are written against POSIX socket behaviour. Run natively
+on Windows — as opposed to inside Git Bash's POSIX layer or WSL — a connection
+to `127.0.0.1:1` surfaces as a connect *timeout* rather than a connect *error*,
+so those two report `upstream_timeout` instead of `upstream_unavailable` and
+fail. That is the platform's socket semantics meeting the deliberate decision
+in `NOTES.md` to map every `httpx.TimeoutException` to `upstream_timeout`.
 
 ### WSL
 
@@ -260,12 +268,12 @@ RHEL, ensure the installed Python includes the standard-library `venv` module.
 
 `GET /tools/convert`
 
-| Parameter | Required | Behaviour                                                    |
-| --------- | -------- | ------------------------------------------------------------ |
-| `amount`  | yes      | Positive, finite decimal; maximum `1e12`.                    |
-| `from`    | yes      | Three-letter currency code, case-insensitive.                |
-| `to`      | yes      | Three-letter currency code, case-insensitive.                |
-| `date`    | no       | Strict `YYYY-MM-DD`; omitted means today in `Europe/Berlin`. |
+| Parameter | Required | Behaviour                                                                 |
+| --------- | -------- | -------------------------------------------------------------------------- |
+| `amount`  | yes      | Positive, finite decimal; maximum `1e12`, at most 10 decimal places.      |
+| `from`    | yes      | Three-letter currency code, case-insensitive.                             |
+| `to`      | yes      | Three-letter currency code, case-insensitive.                             |
+| `date`    | no       | Strict `YYYY-MM-DD`; omitted means today in `Europe/Berlin`.              |
 
 Successful responses contain `amount`, `from`, `to`, `rate`, `result`,
 `rate_date`, `asked_date`, and `source`. Amounts and rates stay decimal-safe;
@@ -281,23 +289,27 @@ instead of presenting the rate as belonging to `asked_date`.
 
 Every error is returned as `{ "error": "<code>", "message": "<readable sentence>" }`.
 
-| Code                        | HTTP | When                                                          |
-| --------------------------- | ---: | ------------------------------------------------------------- |
-| `invalid_request`           |  400 | The request shape is not understood.                          |
-| `invalid_amount`            |  400 | Missing, non-numeric, non-finite, non-positive, or too large. |
-| `invalid_currency_code`     |  400 | `from` or `to` is not three alphabetic letters.               |
-| `unknown_currency`          |  400 | The code is shaped correctly but is not in the ECB catalogue. |
-| `same_currency`             |  400 | `from` and `to` are equal.                                    |
-| `invalid_date`              |  400 | The date is not strict `YYYY-MM-DD`.                          |
-| `date_in_future`            |  400 | The requested date is after today in `Europe/Berlin`.         |
-| `date_before_series_start`  |  400 | The date is before `1999-01-04`.                              |
-| `rate_unavailable`          |  404 | The upstream has no rate for the requested pair/date.         |
-| `rate_too_stale`            |  404 | The available rate is more than 7 days older than requested.  |
-| `upstream_timeout`          |  504 | The upstream did not respond within the timeout.              |
-| `upstream_unavailable`      |  502 | The upstream could not be reached.                            |
-| `upstream_error`            |  502 | The upstream returned an unexpected or 5xx status.            |
-| `upstream_invalid_response` |  502 | The body is not valid JSON or lacks usable rate fields.       |
-| `internal_error`            |  500 | An unexpected error occurred inside this service.             |
+| Code                        | HTTP | When                                                                            |
+| --------------------------- | ---: | -------------------------------------------------------------------------------- |
+| `invalid_request`           |  400 | The request shape is not understood.                                            |
+| `invalid_amount`            |  400 | Missing, non-numeric, non-finite, non-positive, too large, or too many decimals. |
+| `invalid_currency_code`     |  400 | `from` or `to` is not three alphabetic letters.                                 |
+| `unknown_currency`          |  400 | The code is shaped correctly but is not in the ECB catalogue.                   |
+| `same_currency`             |  400 | `from` and `to` are equal.                                                      |
+| `invalid_date`              |  400 | The date is not strict `YYYY-MM-DD`.                                            |
+| `date_in_future`            |  400 | The requested date is after today in `Europe/Berlin`.                           |
+| `date_before_series_start`  |  400 | The date is before `1999-01-04`.                                                |
+| `rate_limited`              |  429 | This client has exceeded its per-minute request allowance.                      |
+| `rate_unavailable`          |  404 | The upstream has no rate for the requested pair/date.                           |
+| `rate_too_stale`            |  404 | The available rate is more than 7 days older than requested.                    |
+| `upstream_timeout`          |  504 | The upstream did not respond within the timeout or the total deadline.          |
+| `upstream_unavailable`      |  502 | The upstream could not be reached.                                              |
+| `upstream_error`            |  502 | The upstream returned an unexpected or 5xx status.                              |
+| `upstream_invalid_response` |  502 | The body is not valid JSON, is too large, or lacks usable rate fields.          |
+| `internal_error`            |  500 | An unexpected error occurred inside this service.                               |
+
+`rate_limited` is the one code the caller should retry unchanged after a short
+wait; every other 4xx means the request itself has to change.
 
 ## Case decisions
 
@@ -318,7 +330,29 @@ Every error is returned as `{ "error": "<code>", "message": "<readable sentence>
 Successful rates are cached by `(from, to, requested date)`; `latest` is a
 separate key from every explicit date. Historical entries live for 24 hours,
 current/latest entries for 5 minutes, and the cache is a bounded LRU. Errors
-are never cached.
+are never cached, with one exception: a currency catalogue that could not be
+fetched is remembered as failed for 60 seconds, because the endpoint fails open
+on that error and would otherwise pay a connect timeout on every request for as
+long as the catalogue stayed down.
+
+Concurrent requests for the same key collapse into a single upstream call, and
+no more than 8 upstream calls run at once.
+
+## Limits
+
+The service is unauthenticated and every cache miss becomes an upstream call,
+so a few ceilings exist to keep one caller from becoming everyone's problem:
+
+| Limit                             | Value       | Configurable                |
+| --------------------------------- | ----------- | --------------------------- |
+| Requests per client per minute    | 60          | `FX_RATE_LIMIT_PER_MINUTE`  |
+| Upstream response body            | 1 MB        | no                          |
+| Total time for one upstream call  | 8 s         | no                          |
+| Concurrent upstream calls         | 8           | no                          |
+| Decimal places in `amount`        | 10          | no                          |
+
+Set `FX_RATE_LIMIT_PER_MINUTE=0` to turn the limiter off when something in
+front of the service already does that job. `/health` is never rate limited.
 
 Requests are sent to `{FX_UPSTREAM_BASE}/v1/...`. The real Frankfurter API
 requires the `/v1` prefix even though the documented base URL does not include

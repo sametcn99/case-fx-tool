@@ -77,6 +77,20 @@ class DateBeforeSeriesStart(FxError):
     error_code = "date_before_series_start"
 
 
+# --- the caller is asking too often ------------------------------------------
+
+
+class RateLimited(FxError):
+    """Not a wrong request, just too many of them.
+
+    Distinct from every 400 because the caller should retry this one later
+    rather than change what it is asking for.
+    """
+
+    http_status = 429
+    error_code = "rate_limited"
+
+
 # --- there is no rate we are willing to stand behind -------------------------
 
 

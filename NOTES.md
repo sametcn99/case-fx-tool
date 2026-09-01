@@ -36,6 +36,44 @@
   errors are mapped to `upstream_unavailable` (502) instead of leaking as an
   `internal_error`.
 
+## Hardening after the security review
+
+- **Bounded `amount` exponent:** `amount` is echoed back in positional
+  notation, so an unbounded negative exponent was a response-size amplifier —
+  `1E-100000000` is positive, finite and far below `MAX_AMOUNT`, and rendered a
+  hundred megabytes from a seventeen-byte query. Bounded at ten decimal places,
+  which is the precision the contract already documented.
+- **Bounded upstream body:** the response is streamed and abandoned past 1 MB.
+  httpx imposes no limit of its own, so previously any body size was buffered
+  faithfully. The cap is applied to decoded bytes, so a compressed body that
+  expands past the limit stops at the limit.
+- **One deadline for the whole upstream call:** httpx's read timeout applies
+  per socket read, which an upstream trickling one byte at a time satisfies
+  forever. An `asyncio.timeout` of 8 s is what actually bounds the exchange.
+- **A broken upstream is never our bug:** the JSON parse now also catches
+  `RecursionError` (deeply nested body) and plain `ValueError` (CPython's
+  integer-string digit limit, which a long unquoted number trips). Both used to
+  escape as `internal_error` (500), which tells the calling model to stop rather
+  than to retry — the opposite of the truth.
+- **One reading of the clock per request:** `today_in_ecb_tz()` was sampled
+  independently by the endpoint, the upstream client and the TTL calculation. A
+  request straddling Berlin midnight had the publication-date bound and the
+  staleness check working from different days. The endpoint now reads it once
+  and threads it down.
+- **Negative cache for the currency catalogue:** failing open on an unavailable
+  catalogue is right, but only if it fails open *fast*. The failure is
+  remembered for 60 seconds rather than re-attempted, and its connect timeout
+  re-paid, on every conversion.
+- **Single-flight:** concurrent misses on the same key share one upstream call
+  instead of each opening their own — worst exactly at a cold start or a TTL
+  expiry, when traffic is heaviest.
+- **Ceilings on abuse:** the rate cache holds 512 entries, so a caller walking
+  more distinct keys than that made this service a free amplifier pointed at
+  the ECB feed, with the resulting throttling landing on our address. A
+  per-client token bucket (60/minute, `FX_RATE_LIMIT_PER_MINUTE=0` to disable)
+  and a ceiling of 8 concurrent upstream calls bound it. `rate_limited` is a
+  new 429 code, and the only 4xx the caller should retry unchanged.
+
 ## With another day
 
 - Add limited retries with jitter for transient timeouts and 5xx responses.

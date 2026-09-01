@@ -13,15 +13,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from app import conversion, validation
+from app import config, conversion, validation
 from app.errors import (
     FxError,
     InvalidAmount,
     InvalidCurrencyCode,
     InvalidDate,
     InvalidRequest,
+    RateLimited,
     UnknownCurrency,
 )
+from app.ratelimit import RateLimiter
 from app.upstream import FrankfurterClient
 
 logger = logging.getLogger("fx-tool")
@@ -29,10 +31,11 @@ logger = logging.getLogger("fx-tool")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Own one upstream client for the whole process lifetime."""
+    """Own one upstream client and one rate limiter for the process lifetime."""
 
     upstream = FrankfurterClient()
     app.state.upstream = upstream
+    app.state.rate_limiter = RateLimiter(config.rate_limit_per_minute())
     try:
         yield
     finally:
@@ -48,6 +51,34 @@ app = FastAPI(
         "actually belongs to."
     ),
 )
+
+
+# --- keep one caller from becoming everyone's problem ------------------------
+
+
+@app.middleware("http")
+async def limit_request_rate(request: Request, call_next):
+    """Throttle the conversion endpoint per client.
+
+    The response is built here rather than raised: middleware sits outside the
+    exception handlers below, so a raised ``FxError`` would escape the one
+    documented error shape instead of being rendered into it.
+
+    ``/health`` is deliberately exempt — an orchestrator's liveness probe is not
+    the traffic this is defending against.
+    """
+
+    limiter: RateLimiter | None = getattr(request.app.state, "rate_limiter", None)
+    if limiter is not None and limiter.enabled and request.url.path == "/tools/convert":
+        client = request.client.host if request.client else "unknown"
+        if not limiter.allow(client):
+            error = RateLimited(
+                "Too many conversion requests; please retry in a moment."
+            )
+            return JSONResponse(
+                status_code=error.http_status, content=error.payload()
+            )
+    return await call_next(request)
 
 
 # --- one error shape, whoever raised it --------------------------------------
@@ -184,11 +215,16 @@ async def convert(
     ),
 ) -> Response:
     """Convert an amount between two currencies at ECB reference rates."""
+    # One reading of the clock for the whole request. Sampling it again deeper
+    # in the call stack lets a request that straddles Berlin midnight ask about
+    # one day and validate the answer against another.
+    today = config.today_in_ecb_tz()
+
     validation.validate_amount(amount)
     base = validation.validate_currency(from_currency, "from")
     target = validation.validate_currency(to_currency, "to")
     validation.validate_pair(base, target)
-    resolved_date = conversion.resolve_asked_date(asked_date)
+    resolved_date = conversion.resolve_asked_date(asked_date, today)
     was_explicit = asked_date is not None
 
     upstream: FrankfurterClient = request.app.state.upstream
@@ -210,6 +246,7 @@ async def convert(
         base,
         target,
         resolved_date if was_explicit else None,
+        today=today,
     )
     conversion.check_staleness(resolved_date, rate_date)
 

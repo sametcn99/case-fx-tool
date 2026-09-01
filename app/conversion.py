@@ -9,12 +9,18 @@ from app import config, validation
 from app.errors import RateTooStale, UpstreamInvalidResponse
 
 
-def resolve_asked_date(raw: str | None) -> date:
-    """Return the explicit date, or today's date in the ECB timezone."""
+def resolve_asked_date(raw: str | None, today: date | None = None) -> date:
+    """Return the explicit date, or today's date in the ECB timezone.
 
+    ``today`` is supplied by the endpoint so that one request reads the clock
+    exactly once. Sampling it again further down lets a request that straddles
+    Berlin midnight disagree with itself about which day it is asking about.
+    """
+
+    today = today or config.today_in_ecb_tz()
     if raw is None:
-        return config.today_in_ecb_tz()
-    return validation.validate_date(raw)
+        return today
+    return validation.validate_date(raw, today)
 
 
 def upstream_path_for(asked_date: date, was_explicit: bool) -> str:
