@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 from decimal import Decimal
 
@@ -11,12 +12,26 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app import validation
 from app.errors import FxError, InvalidAmount, InvalidCurrencyCode, InvalidDate, InvalidRequest
+from app.upstream import FrankfurterClient
 
 logger = logging.getLogger("fx-tool")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Own one upstream client for the whole process lifetime."""
+
+    upstream = FrankfurterClient()
+    app.state.upstream = upstream
+    try:
+        yield
+    finally:
+        await upstream.close()
 
 app = FastAPI(
     title="fx-tool",
     version="0.1.0",
+    lifespan=lifespan,
     description=(
         "Converts an amount between two currencies using ECB reference rates. "
         "Never invents a rate, and always reports the date the rate it used "
