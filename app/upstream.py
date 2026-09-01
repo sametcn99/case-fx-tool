@@ -112,6 +112,7 @@ class FrankfurterClient:
 
         base = base.upper()
         target = target.upper()
+        asked_date = _requested_date(requested_date)
         date_key = _date_key(requested_date)
         key = (base, target, date_key)
 
@@ -124,7 +125,7 @@ class FrankfurterClient:
             params={"base": base, "symbols": target},
             not_found_is_rate=True,
         )
-        result = _parse_rate_payload(payload, target)
+        result = _parse_rate_payload(payload, target, asked_date=asked_date)
 
         # Only successful, structurally valid responses enter the cache.
         self._cache_put(key, result, _ttl_for(date_key))
@@ -186,11 +187,7 @@ class FrankfurterClient:
     ) -> object:
         try:
             response = await self._http.get(url, params=params)
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            raise UpstreamUnavailable(
-                "The exchange-rate service could not be reached."
-            ) from exc
-        except (httpx.ReadTimeout, httpx.TimeoutException) as exc:
+        except httpx.TimeoutException as exc:
             raise UpstreamTimeout(
                 "The exchange-rate service took too long to respond."
             ) from exc
@@ -222,13 +219,19 @@ UpstreamClient = FrankfurterClient
 
 
 def _date_key(requested_date: date | str | None) -> str:
-    if requested_date is None:
+    if requested_date is None or requested_date == "latest":
         return "latest"
+    return _requested_date(requested_date).isoformat()
+
+
+def _requested_date(requested_date: date | str | None) -> date:
+    if requested_date is None or requested_date == "latest":
+        return config.today_in_ecb_tz()
     if isinstance(requested_date, datetime):
-        return requested_date.date().isoformat()
+        return requested_date.date()
     if isinstance(requested_date, date):
-        return requested_date.isoformat()
-    return requested_date
+        return requested_date
+    return datetime.strptime(requested_date, "%Y-%m-%d").date()
 
 
 def _ttl_for(date_key: str) -> int:
@@ -237,7 +240,12 @@ def _ttl_for(date_key: str) -> int:
     return HISTORICAL_TTL_SECONDS
 
 
-def _parse_rate_payload(payload: object, target: str) -> RateResult:
+def _parse_rate_payload(
+    payload: object,
+    target: str,
+    *,
+    asked_date: date | None = None,
+) -> RateResult:
     if not isinstance(payload, Mapping):
         raise UpstreamInvalidResponse(
             "The exchange-rate response is missing its rates object."
@@ -262,6 +270,10 @@ def _parse_rate_payload(payload: object, target: str) -> RateResult:
         raise UpstreamInvalidResponse(
             "The exchange-rate response contains an invalid rate."
         )
+    if rate <= 0:
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains a non-positive rate."
+        )
 
     raw_date = payload.get("date")
     if not isinstance(raw_date, str):
@@ -277,6 +289,13 @@ def _parse_rate_payload(payload: object, target: str) -> RateResult:
         raise UpstreamInvalidResponse(
             "The exchange-rate response contains an invalid publication date."
         ) from exc
+
+    if published_date < config.SERIES_START or (
+        asked_date is not None and published_date > asked_date
+    ):
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains an invalid publication date."
+        )
 
     return rate, published_date
 

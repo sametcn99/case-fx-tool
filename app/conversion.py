@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from app import config, validation
-from app.errors import RateTooStale
+from app.errors import RateTooStale, UpstreamInvalidResponse
 
 
 def resolve_asked_date(raw: str | None) -> date:
@@ -26,6 +26,10 @@ def upstream_path_for(asked_date: date, was_explicit: bool) -> str:
 def check_staleness(asked_date: date, rate_date: date) -> None:
     """Reject a published rate that is older than the documented safety window."""
 
+    if rate_date < config.SERIES_START or rate_date > asked_date:
+        raise UpstreamInvalidResponse(
+            "The exchange-rate response contains an invalid publication date."
+        )
     if asked_date - rate_date > timedelta(days=config.MAX_STALENESS_DAYS):
         raise RateTooStale(
             f"The newest rate available is from {rate_date}, which is too old "

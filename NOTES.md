@@ -20,6 +20,13 @@
   rate request return the more general upstream/rate error.
 - **Decimal amounts:** accept ten decimal places and use `Decimal` throughout;
   only the final result is rounded to two places.
+- **Upstream response hardening:** accept only finite, positive rates and
+  publication dates from `1999-01-04` through the requested date. Invalid
+  upstream data is rejected as `upstream_invalid_response` before it can be
+  cached or shown to a customer.
+- **Timeout classification:** map every `httpx.TimeoutException`, including
+  `ConnectTimeout`, to `upstream_timeout` (504). Actual network failures remain
+  `upstream_unavailable` (502), so callers can distinguish retryable timeouts.
 
 ## With another day
 

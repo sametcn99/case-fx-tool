@@ -92,6 +92,34 @@ def test_eight_day_old_rate_is_rejected(client, fake_upstream):
     )
 
 
+@pytest.mark.parametrize("rate", ["0", "-1"])
+def test_non_positive_upstream_rate_is_rejected(client, fake_upstream, rate):
+    fake_upstream.set_rate(
+        "/v1/2026-08-28",
+        rate_date="2026-08-28",
+        rate=rate,
+    )
+
+    assert_error(
+        client.get(CONVERT, params=query(date="2026-08-28")),
+        502,
+        "upstream_invalid_response",
+    )
+
+
+def test_future_upstream_publication_date_is_rejected(client, fake_upstream):
+    fake_upstream.set_rate(
+        "/v1/2026-08-28",
+        rate_date="2026-08-29",
+    )
+
+    assert_error(
+        client.get(CONVERT, params=query(date="2026-08-28")),
+        502,
+        "upstream_invalid_response",
+    )
+
+
 def test_future_date_is_rejected_before_upstream(client, fake_upstream):
     tomorrow = config.today_in_ecb_tz() + timedelta(days=1)
 

@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import config, conversion
-from app.errors import RateTooStale
+from app.errors import RateTooStale, UpstreamInvalidResponse
 from app.main import app
 from app.upstream import FrankfurterClient
 
@@ -33,6 +33,15 @@ def test_staleness_is_strictly_greater_than_seven_days():
     conversion.check_staleness(asked, date(2026, 8, 22))
     with pytest.raises(RateTooStale):
         conversion.check_staleness(asked, date(2026, 8, 21))
+
+
+@pytest.mark.parametrize(
+    "rate_date",
+    [date(1998, 12, 31), date(2026, 8, 30)],
+)
+def test_staleness_rejects_publication_date_outside_requested_period(rate_date):
+    with pytest.raises(UpstreamInvalidResponse):
+        conversion.check_staleness(date(2026, 8, 29), rate_date)
 
 
 def test_result_rounds_half_up_only_after_multiplication():

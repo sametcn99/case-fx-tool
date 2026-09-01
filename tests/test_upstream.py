@@ -127,6 +127,43 @@ async def test_upstream_failures_are_mapped(client, fake, status, content, error
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_rate", ["0", "-1"])
+async def test_non_positive_rate_is_invalid(client, fake, raw_rate):
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        content=(
+            f'{{"date":"2026-08-28","rates":{{"TRY":{raw_rate}}}}}'
+        ).encode(),
+    )
+
+    with pytest.raises(UpstreamInvalidResponse):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_future_publication_date_is_invalid_and_not_cached(client, fake):
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        content=b'{"date":"2026-08-29","rates":{"TRY":1.2}}',
+    )
+
+    with pytest.raises(UpstreamInvalidResponse):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
+
+    fake.responses["/v1/2026-08-28"] = httpx.Response(
+        200,
+        content=b'{"date":"2026-08-28","rates":{"TRY":1.2}}',
+    )
+    assert await client.get_rate("EUR", "TRY", "2026-08-28") == (
+        Decimal("1.2"),
+        date(2026, 8, 28),
+    )
+    assert len(fake.calls) == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_connect_failure_is_unavailable():
     async def fail(request):
         raise httpx.ConnectError("offline", request=request)
@@ -154,6 +191,17 @@ async def test_closed_local_port_is_unavailable(monkeypatch):
 async def test_read_timeout_is_timeout():
     async def fail(request):
         raise httpx.ReadTimeout("slow", request=request)
+
+    client = FrankfurterClient(transport=httpx.MockTransport(fail))
+    with pytest.raises(UpstreamTimeout):
+        await client.get_rate("EUR", "TRY", "2026-08-28")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_is_timeout():
+    async def fail(request):
+        raise httpx.ConnectTimeout("connect timed out", request=request)
 
     client = FrankfurterClient(transport=httpx.MockTransport(fail))
     with pytest.raises(UpstreamTimeout):
