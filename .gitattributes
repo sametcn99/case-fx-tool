@@ -1,0 +1,3 @@
+# Keep the shell scripts LF-only: they are written on Windows and run on Linux
+# during review, and a CRLF shebang fails there with a confusing error.
+*.sh text eol=lf

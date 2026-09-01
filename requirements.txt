@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+httpx==0.28.1
+
+# zoneinfo has no system tz database on Windows; the ECB day boundary is drawn
+# in Europe/Berlin, so this is a real dependency there and harmless elsewhere.
+tzdata==2026.3
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
