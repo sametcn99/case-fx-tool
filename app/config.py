@@ -10,7 +10,7 @@ the review harness points FX_UPSTREAM_BASE at a fake upstream.
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,15 @@ MAX_AMOUNT = Decimal("1e12")
 # The ECB publishes on Frankfurt time, so that is where the day boundary sits.
 # Using UTC would put "today" a day behind during the early hours.
 ECB_TZ = ZoneInfo("Europe/Berlin")
+
+
+def today_in_ecb_tz() -> date:
+    """Today, as the ECB would date it.
+
+    Lives here next to ECB_TZ because the question it answers is "where is the
+    day boundary", which is a setting rather than conversion logic.
+    """
+    return datetime.now(tz=ECB_TZ).date()
 
 
 def upstream_base() -> str:
